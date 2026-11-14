@@ -169,6 +169,36 @@ class HealthResponse(BaseModel):
     status: str
     commit_seq: int
     schema_version: int
+    history_enabled: bool
+    history_start_seq: int | None
+
+
+class HistoryEnableResponse(BaseModel):
+    history_start_seq: int
+    current_commit_seq: int
+    already_enabled: bool
+    meters_anchored: int
+
+
+class HistoryStateResponse(BaseModel):
+    """Meter state reconstructed for one commit sequence.
+
+    ``commit_seq`` is the sequence that was asked for; ``state_commit_seq`` is
+    the commit whose snapshot carries that state (equal unless the requested
+    commit only affected other meters).  Sequence numbers are never reused and
+    never rewritten, so paying this price keeps every intermediate commit
+    answerable without inventing a state that was never committed.
+    """
+
+    meter_id: str
+    commit_seq: int
+    state_commit_seq: int
+    history_start_seq: int
+    current_commit_seq: int
+    readings: list[ReadingOut]
+    intervals: list[IntervalOut]
+    breaks: list[IntervalOut]
+    usage_total: int
 
 
 class ConflictDetail(BaseModel):

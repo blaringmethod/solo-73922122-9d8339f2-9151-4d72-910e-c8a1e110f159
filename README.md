@@ -17,7 +17,7 @@ docker compose up -d --build
 | <http://localhost:8000/redoc> | ReDoc |
 | <http://localhost:8000/openapi.json> | OpenAPI 规范 |
 | <http://localhost:8002/docs> | api-2，第二个进程，同一份数据 |
-| <http://localhost:8000/health> | 健康检查（含当前提交序号） |
+| <http://localhost:8000/health> | 健康检查（当前提交序号、历史是否启用） |
 
 两个端口背后是**两个独立的 API 进程，共用 `/data/energy.sqlite3`**；可以交替
 向两个端口发送写入以验证跨进程一致性（`scripts/e2e_compose.py` 就是这样做的）。
@@ -117,6 +117,71 @@ python3 -m pytest                                        # 含双进程并发/�
 
 `GET /api/v1/meters` 列出所有电表的汇总。无任何读数的电表返回 404。
 
+### 历史 — `POST /api/v1/history/enable` 与 `GET /api/v1/meters/{meter_id}/history/{commit_seq}`
+
+下游此前在某次提交后看到过什么，可以按提交序号回放。历史**默认关闭**，先启用：
+
+```bash
+curl -s -X POST localhost:8000/api/v1/history/enable
+# {"history_start_seq": 12, "current_commit_seq": 12,
+#  "already_enabled": false, "meters_anchored": 3}
+```
+
+* 启用动作是一个事务：起点序号与当时每只已有电表的完整快照一起写入。起点
+  一旦写入不再改变，重复调用返回原值（`already_enabled=true`）。
+* 起点**之前**的提交没有证据，查询这些序号会被明确拒绝。
+
+启用后，每次写提交（补传/撤销）都会在同一事务里为受影响的电表追加一份
+完整快照：
+
+```bash
+curl -s localhost:8000/api/v1/meters/M-1001/history/14 | python3 -m json.tool
+```
+
+```json
+{
+  "meter_id": "M-1001",
+  "commit_seq": 14,
+  "state_commit_seq": 14,
+  "history_start_seq": 12,
+  "current_commit_seq": 18,
+  "readings": [{"source_record_id": "...", "read_at": "...", "reading": 1000,
+                "meter_replaced": false, "commit_seq": 13}],
+  "intervals": [{"from_source_record_id": "...", "to_source_record_id": "...",
+                 "usage": 120, "is_break": false, "break_reason": null,
+                 "commit_seq": 14}],
+  "breaks": [],
+  "usage_total": 120
+}
+```
+
+| 字段 | 含义 |
+| --- | --- |
+| `commit_seq` | 请求的提交序号 |
+| `state_commit_seq` | 实际提供该状态的快照所属提交；该提交未涉及此电表时小于 `commit_seq` |
+| `history_start_seq` / `current_commit_seq` | 历史起点与该次读取时的最新提交（同一快照内读出） |
+
+语义：
+
+* **迟到读数不改写旧提交。** 补传只会产生新的提交与新快照，`/history/{旧序号}`
+  的内容保持不变。
+* **已撤销的读数仍出现在它原来的提交里。** 撤销同样只是新提交；历史证据
+  只追加、不修改、不删除（库内触发器强制）。
+* `state_commit_seq` 小于 `commit_seq` 表示该提交没有改动这只电表，返回的是
+  当时仍然生效的状态。
+* 该电表在该提交时已被整体撤销（没有任何读数）时，返回空状态
+  （`readings`/`intervals` 为空，`usage_total` 为 0）；电表在该提交时尚未
+  出现则返回 404 `meter_not_found`。
+
+历史查询错误：
+
+| 状态码 | `code` | 含义 |
+| --- | --- | --- |
+| 409 | `history_not_enabled` | 尚未启用，先调用 `/api/v1/history/enable` |
+| 409 | `history_before_start` | 序号早于历史起点，没有重建依据 |
+| 404 | `commit_not_found` | 序号尚未产生 |
+| 404 | `meter_not_found` | 该电表在该提交没有读数 |
+
 ### 错误
 
 | 状态码 | 含义 |
@@ -148,23 +213,29 @@ python3 -m pytest                                        # 含双进程并发/�
   `(source_record_id)` 与 `(meter_id, read_at_us)` 的唯一约束在库内兜底。
 * 读数与区间在**同一个事务**内写入；每次变更后该电表的区间全部重建，
   因此区间表始终是读数表的函数。
+* 历史快照与前两者在**同一次提交**内写入：三者要么一起可见，要么一起不存在。
+  历史查询在一个读事务里读出起点、当前序号和快照，只看到同一已提交状态；
+  快照只追加，库内触发器禁止 `UPDATE`/`DELETE`。
 * 查询在显式读事务（WAL 快照）中执行，读数、区间、断点、`usage_total`
   同属一次已提交状态；响应里的 `commit_seq` 标识该状态。
 * 失败/重启：整笔提交在一个事务内，未提交即回滚，进程被杀不会留下半笔
-  结果；启动时校验 `user_version`，测试另跑 `PRAGMA integrity_check` 与
+  结果；启动时校验 `user_version` 并支持从 v1 库就地升级（新增表为附加项，
+  历史保持关闭）。测试另跑 `PRAGMA integrity_check` 与
   `foreign_key_check`。
 * 区间表有 `CHECK` 约束：断点区间 `usage` 必须为 `NULL`，正常区间必须有值。
 
 ## 测试
 
 ```bash
-python3 -m pytest            # 37 个用例
+python3 -m pytest            # 59 个用例
 ```
 
 * `tests/test_api.py`：区间/断点/乱序/幂等/冲突/撤销/窗口/校验。
+* `tests/test_history.py`：启用起点、迟到读数不改写旧提交、撤销保留原提交、
+  历史拒绝规则、快照不可变、失败提交不留证据、重启后仍可查。
 * `tests/test_concurrency.py`：启动两个真实进程共享同一个 SQLite 文件，
-  并发写、并发重试、竞争冲突、持续读写一致性、进程崩溃（`os._exit`）、
-  重启后数据延续、未提交事务回滚。
+  并发写、并发重试、竞争冲突、持续读写一致性、跨进程历史一致性、进程崩溃
+  （`os._exit`）、重启后数据延续、未提交事务回滚。
 * `tests/test_durability.py`：区间重建中途异常时整批回滚、提交序号不前进、
   多进程同时初始化建库、schema 版本保护。
 
@@ -177,7 +248,8 @@ python3 scripts/e2e_compose.py http://localhost:8000 http://localhost:8002
 ## 目录结构
 
 ```
-app/            FastAPI 应用（main.py 路由、service.py 领域逻辑、db.py 存储）
+app/            FastAPI 应用（main.py 路由、service.py 领域逻辑、db.py 存储、
+                history.py 提交历史证据）
 tests/          功能与并发/故障测试
 scripts/        Compose 部署冒烟脚本
 Dockerfile, docker-compose.yml

@@ -24,63 +24,112 @@ from typing import Iterator
 
 from .config import Settings
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+# Version 1 databases (created before history tracking existed) are upgraded
+# in place: the new tables are additive and history starts disabled.
+_SUPPORTED_SCHEMA_VERSIONS = (0, 1, SCHEMA_VERSION)
+
+HISTORY_START_KEY = "history_start_seq"
 
 
 class DatabaseBusy(RuntimeError):
     """The database stayed locked longer than the configured timeout."""
 
 
-_SCHEMA = """
-CREATE TABLE IF NOT EXISTS meta (
-    key   TEXT PRIMARY KEY,
-    value TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS readings (
-    id                INTEGER PRIMARY KEY AUTOINCREMENT,
-    source_record_id  TEXT    NOT NULL,
-    meter_id          TEXT    NOT NULL,
-    read_at_us        INTEGER NOT NULL,
-    reading           INTEGER NOT NULL CHECK (reading >= 0),
-    meter_replaced    INTEGER NOT NULL CHECK (meter_replaced IN (0, 1)),
-    content_hash      TEXT    NOT NULL,
-    created_commit_seq INTEGER NOT NULL,
-    UNIQUE (source_record_id),
-    UNIQUE (meter_id, read_at_us)
-);
-
-CREATE TABLE IF NOT EXISTS intervals (
-    id            INTEGER PRIMARY KEY,
-    meter_id      TEXT    NOT NULL,
-    from_reading_id INTEGER NOT NULL REFERENCES readings(id) ON DELETE CASCADE,
-    to_reading_id   INTEGER NOT NULL REFERENCES readings(id) ON DELETE CASCADE,
-    from_at_us    INTEGER NOT NULL,
-    to_at_us      INTEGER NOT NULL,
-    from_value    INTEGER NOT NULL,
-    to_value      INTEGER NOT NULL,
-    usage         INTEGER,
-    is_break      INTEGER NOT NULL CHECK (is_break IN (0, 1)),
-    break_reason  TEXT,
-    commit_seq    INTEGER NOT NULL,
-    UNIQUE (meter_id, to_reading_id),
-    CHECK (
-        (is_break = 0 AND usage IS NOT NULL AND break_reason IS NULL)
-        OR
-        (is_break = 1 AND usage IS NULL
-         AND break_reason IN ('meter_replaced', 'counter_rollback'))
+# One SQL statement per string.  The previous implementation split a single
+# script on semicolons, which cannot represent triggers (their bodies contain
+# semicolons), so the statements are kept separately.
+_SCHEMA_STATEMENTS = (
+    """
+    CREATE TABLE IF NOT EXISTS meta (
+        key   TEXT PRIMARY KEY,
+        value TEXT NOT NULL
     )
-);
-
-CREATE INDEX IF NOT EXISTS idx_intervals_meter_to
-    ON intervals (meter_id, to_at_us);
-
-CREATE INDEX IF NOT EXISTS idx_intervals_from
-    ON intervals (from_reading_id);
-
-CREATE INDEX IF NOT EXISTS idx_intervals_to
-    ON intervals (to_reading_id);
-"""
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS readings (
+        id                INTEGER PRIMARY KEY AUTOINCREMENT,
+        source_record_id  TEXT    NOT NULL,
+        meter_id          TEXT    NOT NULL,
+        read_at_us        INTEGER NOT NULL,
+        reading           INTEGER NOT NULL CHECK (reading >= 0),
+        meter_replaced    INTEGER NOT NULL CHECK (meter_replaced IN (0, 1)),
+        content_hash      TEXT    NOT NULL,
+        created_commit_seq INTEGER NOT NULL,
+        UNIQUE (source_record_id),
+        UNIQUE (meter_id, read_at_us)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS intervals (
+        id            INTEGER PRIMARY KEY,
+        meter_id      TEXT    NOT NULL,
+        from_reading_id INTEGER NOT NULL REFERENCES readings(id) ON DELETE CASCADE,
+        to_reading_id   INTEGER NOT NULL REFERENCES readings(id) ON DELETE CASCADE,
+        from_at_us    INTEGER NOT NULL,
+        to_at_us      INTEGER NOT NULL,
+        from_value    INTEGER NOT NULL,
+        to_value      INTEGER NOT NULL,
+        usage         INTEGER,
+        is_break      INTEGER NOT NULL CHECK (is_break IN (0, 1)),
+        break_reason  TEXT,
+        commit_seq    INTEGER NOT NULL,
+        UNIQUE (meter_id, to_reading_id),
+        CHECK (
+            (is_break = 0 AND usage IS NOT NULL AND break_reason IS NULL)
+            OR
+            (is_break = 1 AND usage IS NULL
+             AND break_reason IN ('meter_replaced', 'counter_rollback'))
+        )
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_intervals_meter_to
+        ON intervals (meter_id, to_at_us)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_intervals_from
+        ON intervals (from_reading_id)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_intervals_to
+        ON intervals (to_reading_id)
+    """,
+    # Immutable full-state evidence for one meter at one commit sequence.
+    # `payload` is a compact JSON document with the readings and intervals the
+    # downstream consumers could have observed at that commit.
+    """
+    CREATE TABLE IF NOT EXISTS history_snapshots (
+        meter_id       TEXT    NOT NULL,
+        commit_seq     INTEGER NOT NULL CHECK (commit_seq >= 0),
+        reading_count  INTEGER NOT NULL CHECK (reading_count >= 0),
+        interval_count INTEGER NOT NULL CHECK (interval_count >= 0),
+        usage_total    INTEGER NOT NULL,
+        payload        TEXT    NOT NULL,
+        PRIMARY KEY (meter_id, commit_seq)
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_history_snapshots_commit
+        ON history_snapshots (commit_seq)
+    """,
+    # Late readings and undo operations must never rewrite what was already
+    # committed.  Enforce that at the storage layer as well as in the service.
+    """
+    CREATE TRIGGER IF NOT EXISTS history_snapshots_no_update
+    BEFORE UPDATE ON history_snapshots
+    BEGIN
+        SELECT RAISE(ABORT, 'history snapshots are immutable');
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS history_snapshots_no_delete
+    BEFORE DELETE ON history_snapshots
+    BEGIN
+        SELECT RAISE(ABORT, 'history snapshots are immutable');
+    END
+    """,
+)
 
 
 def _is_lock_error(exc: BaseException) -> bool:
@@ -129,15 +178,14 @@ def initialize(settings: Settings) -> None:
                 # journal_mode cannot be changed inside a transaction.
                 conn.execute("PRAGMA journal_mode = WAL")
                 with write_transaction(conn):
-                    for statement in _SCHEMA.split(";"):
-                        if statement.strip():
-                            conn.execute(statement)
+                    for statement in _SCHEMA_STATEMENTS:
+                        conn.execute(statement)
                     conn.execute(
                         "INSERT OR IGNORE INTO meta (key, value) "
                         "VALUES ('commit_seq', '0')"
                     )
                     user_version = conn.execute("PRAGMA user_version").fetchone()[0]
-                    if user_version not in (0, SCHEMA_VERSION):
+                    if user_version not in _SUPPORTED_SCHEMA_VERSIONS:
                         raise RuntimeError(
                             f"unsupported schema version {user_version}"
                         )
@@ -198,3 +246,23 @@ def bump_commit_seq(conn: sqlite3.Connection) -> int:
         "UPDATE meta SET value = ? WHERE key = 'commit_seq'", (str(seq),)
     )
     return seq
+
+
+def history_start_seq(conn: sqlite3.Connection) -> int | None:
+    """Return the commit sequence from which history evidence is kept.
+
+    ``None`` means history tracking has never been enabled for this
+    database.  The value is written once, inside the transaction that enables
+    history, and is never changed afterwards.
+    """
+    row = conn.execute(
+        "SELECT value FROM meta WHERE key = ?", (HISTORY_START_KEY,)
+    ).fetchone()
+    return None if row is None else int(row["value"])
+
+
+def set_history_start_seq(conn: sqlite3.Connection, seq: int) -> None:
+    conn.execute(
+        "INSERT OR IGNORE INTO meta (key, value) VALUES (?, ?)",
+        (HISTORY_START_KEY, str(seq)),
+    )

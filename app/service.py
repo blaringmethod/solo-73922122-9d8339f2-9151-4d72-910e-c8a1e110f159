@@ -31,11 +31,19 @@ from .db import (
     bump_commit_seq,
     connection,
     current_commit_seq,
+    history_start_seq,
     read_transaction,
     write_transaction,
 )
+from .history import (
+    query_history,
+    record_commit_snapshots,
+    start_history,
+)
 from .models import (
     ConflictDetail,
+    HistoryEnableResponse,
+    HistoryStateResponse,
     IntervalOut,
     MeterStateResponse,
     MeterSummary,
@@ -375,6 +383,7 @@ def ingest(
                 )
             for meter_id in sorted(meters):
                 _recompute_intervals(conn, meter_id, commit_seq)
+            record_commit_snapshots(conn, meters, commit_seq)
 
             return _mutation_response(
                 conn,
@@ -435,6 +444,7 @@ def undo(
             )
             for meter_id in sorted(meters):
                 _recompute_intervals(conn, meter_id, commit_seq)
+            record_commit_snapshots(conn, meters, commit_seq)
 
             return _mutation_response(
                 conn,
@@ -443,6 +453,38 @@ def undo(
                 records=records,
                 meters=meters,
             )
+
+
+def enable_history(settings: Settings) -> HistoryEnableResponse:
+    """Anchor the history baseline at the current committed state.
+
+    The start sequence and the anchor snapshots of every existing meter are
+    written in one write transaction, together with no other change.  Calling
+    it again returns the existing anchor without rewriting anything.
+    """
+    with connection(settings) as conn:
+        with write_transaction(conn):
+            already = history_start_seq(conn) is not None
+            seq = start_history(conn)
+            meters_anchored = conn.execute(
+                "SELECT COUNT(*) FROM history_snapshots WHERE commit_seq = ?",
+                (seq,),
+            ).fetchone()[0]
+            return HistoryEnableResponse(
+                history_start_seq=seq,
+                current_commit_seq=current_commit_seq(conn),
+                already_enabled=already,
+                meters_anchored=int(meters_anchored),
+            )
+
+
+def get_history(
+    settings: Settings, meter_id: str, commit_seq: int
+) -> HistoryStateResponse:
+    """Answer a history query from one committed snapshot of the evidence."""
+    with connection(settings) as conn:
+        with read_transaction(conn):
+            return query_history(conn, meter_id, commit_seq)
 
 
 def list_meters(settings: Settings) -> list[MeterSummary]:

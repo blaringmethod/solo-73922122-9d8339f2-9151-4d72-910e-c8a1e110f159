@@ -9,11 +9,21 @@ from fastapi import FastAPI, Query, Request
 from fastapi.responses import JSONResponse
 
 from .config import Settings
-from .db import DatabaseBusy, initialize
+from .db import (
+    DatabaseBusy,
+    connection,
+    current_commit_seq,
+    history_start_seq,
+    initialize,
+    read_transaction,
+)
+from .history import HistoryError
 from .models import (
     ConflictResponse,
     ErrorResponse,
     HealthResponse,
+    HistoryEnableResponse,
+    HistoryStateResponse,
     IngestRequest,
     MeterStateResponse,
     MeterSummary,
@@ -21,7 +31,15 @@ from .models import (
     UndoRequest,
 )
 from .seed import seed_demo_data
-from .service import BatchRejected, ingest, list_meters, query_meter, undo
+from .service import (
+    BatchRejected,
+    enable_history,
+    get_history,
+    ingest,
+    list_meters,
+    query_meter,
+    undo,
+)
 
 _BUSY_MESSAGE = "database is locked"
 
@@ -44,13 +62,17 @@ def create_app(settings: Settings | None = None, seed_demo: bool = False) -> Fas
 
     app = FastAPI(
         title="园区电表区间用电量 API",
-        version="1.0.0",
+        version="1.1.0",
         description=(
             "把网关补传的累计读数转换成区间用电量。\n\n"
             "* **入仓** `POST /api/v1/readings`：整批原子提交，乱序补传按电表号+时刻排序后求差。\n"
             "* **撤销** `POST /api/v1/readings/undo`：按源记录号撤销，并重算受影响区间。\n"
-            "* **查询** `GET /api/v1/meters/{meter_id}`：单次一致性快照，返回读数、区间、断点。\n\n"
-            "同一源记录号重复提交相同内容为幂等重试；同号异内容、同表同刻冲突会整批拒绝（409）。"
+            "* **查询** `GET /api/v1/meters/{meter_id}`：单次一致性快照，返回读数、区间、断点。\n"
+            "* **启用历史** `POST /api/v1/history/enable`：以当前已提交状态为起点开始留证。\n"
+            "* **历史查询** `GET /api/v1/meters/{meter_id}/history/{commit_seq}`："
+            "按提交序号回放当时的读数、区间用量与断点。\n\n"
+            "同一源记录号重复提交相同内容为幂等重试；同号异内容、同表同刻冲突会整批拒绝（409）。\n"
+            "历史证据与现行数据同笔提交、只追加不改写：迟到读数与撤销都不会改变旧提交的证据。"
         ),
         lifespan=lifespan,
     )
@@ -95,19 +117,31 @@ def create_app(settings: Settings | None = None, seed_demo: bool = False) -> Fas
             ).model_dump(),
         )
 
+    @app.exception_handler(HistoryError)
+    async def _history_handler(request: Request, exc: HistoryError) -> JSONResponse:
+        return JSONResponse(
+            status_code=exc.status_code,
+            content=ErrorResponse(code=exc.code, message=exc.message).model_dump(),
+        )
+
     def settings_of(request: Request) -> Settings:
         return request.app.state.settings
 
     @app.get("/health", response_model=HealthResponse, tags=["运维"])
     def health(request: Request) -> HealthResponse:
-        """进程与数据库连通性检查。"""
-        from .db import connection, current_commit_seq
+        """进程与数据库连通性检查（含提交序号与历史开关）。"""
         from .db import SCHEMA_VERSION
 
         with connection(settings_of(request)) as conn:
-            seq = current_commit_seq(conn)
+            with read_transaction(conn):
+                seq = current_commit_seq(conn)
+                start_seq = history_start_seq(conn)
         return HealthResponse(
-            status="ok", commit_seq=seq, schema_version=SCHEMA_VERSION
+            status="ok",
+            commit_seq=seq,
+            schema_version=SCHEMA_VERSION,
+            history_enabled=start_seq is not None,
+            history_start_seq=start_seq,
         )
 
     @app.post(
@@ -212,5 +246,44 @@ def create_app(settings: Settings | None = None, seed_demo: bool = False) -> Fas
                 ).model_dump(),
             )
         return state
+
+    @app.post(
+        "/api/v1/history/enable",
+        response_model=HistoryEnableResponse,
+        responses={503: {"model": ErrorResponse}},
+        tags=["历史"],
+    )
+    def enable_history_endpoint(request: Request) -> HistoryEnableResponse:
+        """启用历史追踪，以当前已提交状态作为起点。
+
+        起点提交序号写一次后不再改变；启用时会给当时已有的每只电表各记一份
+        完整快照，作为此后补传、撤销重建历史的依据。重复调用不会改写任何
+        历史证据，返回原有的起点。
+        """
+        return enable_history(settings_of(request))
+
+    @app.get(
+        "/api/v1/meters/{meter_id}/history/{commit_seq}",
+        response_model=HistoryStateResponse,
+        responses={
+            404: {"model": ErrorResponse, "description": "电表或提交序号不存在"},
+            409: {"model": ErrorResponse, "description": "历史未启用或序号早于起点"},
+            503: {"model": ErrorResponse},
+        },
+        tags=["历史"],
+    )
+    def get_meter_history(
+        meter_id: str, commit_seq: int, request: Request
+    ) -> HistoryStateResponse:
+        """查询单只电表在某个提交序号时的历史状态。
+
+        * 返回当时的读数、相邻区间用量与断点；已撤销的读数仍出现在它原来的
+          提交里。
+        * 历史只读取同一已提交快照，并与现行数据同笔写入，不会看到半笔结果。
+        * 早于历史起点（409 `history_before_start`）、尚未产生（404
+          `commit_not_found`）或历史未启用（409 `history_not_enabled`）都会被
+          明确拒绝。
+        """
+        return get_history(settings_of(request), meter_id, commit_seq)
 
     return app

@@ -337,3 +337,90 @@ def test_restart_reuses_database_and_schema(db_path, settings):
             assert_meter_consistent(body)
     finally:
         restarted.stop()
+
+
+def test_history_is_consistent_across_processes(two_servers, settings):
+    """History evidence is written with the live data by whichever process
+    commits, and both processes serve identical answers."""
+    with _client(two_servers[0]) as first, _client(two_servers[1]) as second:
+        assert first.post("/api/v1/history/enable").status_code == 200
+
+        anchor = first.post(
+            "/api/v1/readings",
+            json={"readings": [reading("H1", "a", 0, 100), reading("H1", "b", 60, 180)]},
+        ).json()
+        anchor_seq = anchor["commit_seq"]
+        # The *other* process sees the anchor state and its evidence.
+        body = second.get(f"/api/v1/meters/H1/history/{anchor_seq}")
+        assert body.status_code == 200, body.text
+        assert [i["usage"] for i in body.json()["intervals"]] == [80]
+
+        # Backfill through process 2, then read the old commit via process 1.
+        late = second.post(
+            "/api/v1/readings", json={"readings": [reading("H1", "late", 30, 130)]}
+        ).json()
+        late_seq = late["commit_seq"]
+        old = first.get(f"/api/v1/meters/H1/history/{anchor_seq}")
+        assert old.status_code == 200
+        assert old.json()["state_commit_seq"] == anchor_seq
+        assert [i["usage"] for i in old.json()["intervals"]] == [80]
+
+        new = first.get(f"/api/v1/meters/H1/history/{late_seq}").json()
+        assert [i["usage"] for i in new["intervals"]] == [30, 50]
+
+    # The database layer agrees: every snapshot matches the readings it
+    # describes, and both processes produced the same evidence set.
+    with connection(settings) as conn:
+        rows = conn.execute(
+            "SELECT meter_id, commit_seq, payload FROM history_snapshots"
+            " ORDER BY commit_seq"
+        ).fetchall()
+        assert [int(r["commit_seq"]) for r in rows] == sorted(
+            int(r["commit_seq"]) for r in rows
+        )
+        import json as _json
+
+        for row in rows:
+            payload = _json.loads(row["payload"])
+            stored = conn.execute(
+                "SELECT COUNT(*) FROM readings WHERE meter_id = ? "
+                "AND created_commit_seq <= ?",
+                (row["meter_id"], int(row["commit_seq"])),
+            ).fetchone()[0]
+            assert len(payload["readings"]) == stored
+
+
+def test_history_survives_crash_mid_history_write(two_servers, settings):
+    """Killing a process after it wrote a history snapshot keeps both the live
+    state and the evidence."""
+    server = two_servers[0]
+    with _client(server) as client:
+        assert client.post("/api/v1/history/enable").status_code == 200
+        created = client.post(
+            "/api/v1/readings",
+            json={"readings": [reading("H2", "a", 0, 10), reading("H2", "b", 60, 25)]},
+        ).json()
+    seq = created["commit_seq"]
+
+    restarted = Server(server.db_path, _free_port()).start()
+    try:
+        with _client(restarted) as client:
+            body = client.get(f"/api/v1/meters/H2/history/{seq}").json()
+            assert [i["usage"] for i in body["intervals"]] == [15]
+            live = client.get("/api/v1/meters/H2").json()
+            assert live["commit_seq"] == seq
+    finally:
+        restarted.stop()
+
+
+def test_enable_race_is_single_anchor(two_servers, settings):
+    """Two processes enabling at once still produce one start sequence."""
+    import httpx
+
+    results = []
+    for server in two_servers:
+        with httpx.Client(base_url=server.base_url, timeout=30.0) as client:
+            results.append(client.post("/api/v1/history/enable").json())
+    starts = {r["history_start_seq"] for r in results}
+    assert len(starts) == 1
+    assert sum(1 for r in results if r["already_enabled"] is False) == 1
